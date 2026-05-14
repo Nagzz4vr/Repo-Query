@@ -1,0 +1,21 @@
+.env
+__pycache__/
+.venv/
+data/
+
+*.pyc
+*.ipynb
+*.csv
+*.svg
+*.txt
+
+*.jsonl
+*.parquet
+*.pkl
+*.md
+# allow only license markdown/text explicitly
+!LICENSE.txt
+
+cache_storage/
+outputs/
+traces/
