@@ -4,7 +4,7 @@ import ast as _ast
 import hashlib
 import logging
 from typing import Any
-from shared_models import Chunk, ChunkMethod, ChunkedDocument 
+from Chunker.shared_models import Chunk, ChunkMethod, ChunkedDocument 
 
 logging.basicConfig(
     level=logging.INFO,
@@ -23,7 +23,7 @@ class ASTChunker:
 
         return self._single_file_document(file_dict)
     
-    def _chunk_python(self, file_dict: dict) -> list[dict]:
+    def _chunk_python(self, file_dict: dict) -> ChunkedDocument:
         source = file_dict["source_code"]
         path = file_dict["path"]
 

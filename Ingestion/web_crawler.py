@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from typing import  Generic, Optional, Type, TypeVar,Any
 from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, CacheMode
 from crawl4ai.extraction_strategy import LLMExtractionStrategy
@@ -17,7 +17,7 @@ from tenacity import (
 )
 import logging
 from datetime import datetime, timezone
-
+import hashlib 
 
 logger = logging.getLogger(__name__)
 
@@ -92,8 +92,7 @@ class UniversalScraper:
         self.provider = provider
         self.api_token = (
             api_token
-            or os.getenv("OPENAI_API_KEY")
-            or os.getenv("ANTHROPIC_API_KEY")
+            or os.getenv("GROQ_API_KEY")
         )
         if not self.api_token:
             raise ValueError(
@@ -230,7 +229,7 @@ class UniversalScraper:
             original_token_count=original_tokens,
             compressed_token_count=compressed_tokens,
             compression_ratio=compression_ratio,
-            content_hash=self._sha256(raw_markdown),
+            content_hash=self._calculate_hash(raw_markdown),
             headers=dict(crawl_result.metadata.get("headers", {})),
             links_count=(
                 len(crawl_result.links.get("internal", []))
@@ -268,7 +267,7 @@ class UniversalScraper:
         return max(len(text) // 4, 0)
  
     @staticmethod
-    def _sha256(text: str) -> str:
+    def _calculate_hash(text: str) -> str:
         return hashlib.sha256(text.encode()).hexdigest()
     
     def _failure_result(
@@ -339,7 +338,7 @@ class UniversalScraper:
         Path(output_dir).mkdir(parents=True, exist_ok=True)
         
         # Create timestamp-based filename
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         safe_url = result.metadata.url.replace("https://", "").replace("http://", "").replace("/", "_")[:50]
         base_filename = f"{timestamp}_{safe_url}"
         
@@ -348,7 +347,7 @@ class UniversalScraper:
             json.dump(result.metadata.model_dump(), f, indent=2)
 
         with open(f"{output_dir}/{base_filename}_extracted.json", "w") as f:
-            json.dump(result.extracted_data, f, indent=2)
+            json.dump(result.extracted_data.model_dump(), f, indent=2)
         
 
         with open(f"{output_dir}/{base_filename}_compressed.md", "w") as f:

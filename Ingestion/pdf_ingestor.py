@@ -108,6 +108,7 @@ class PdfIngestor:
 
         self.base_dir=Path(base_dir).resolve()
         self.filepath=self._validate_safe_path(filepath)
+        self.config=IngestorConfig()
         self._check_format()
         self._validate_exists()
 
@@ -178,7 +179,7 @@ class PdfIngestor:
 
             for block in data.get("blocks",[]):
                 btype=block.get("type",0)
-                bbox=tuple(block.get("bbox"),(0,0,0,0))
+                bbox=block.get("bbox", (0,0,0,0))
                 #image block
                 if btype==1:
                     has_images=True
@@ -217,7 +218,7 @@ class PdfIngestor:
                 likely_scanned = native_chars < self.config.scanned_text_threshold
                 likely_has_tables = self._heuristic_table_detection(blocks, page_w)
 
-                pages.append(
+            pages.append(
                     PageLayout(
                         page_number=page_num,
                         width=page_w,
