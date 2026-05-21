@@ -1,198 +1,264 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 from enum import Enum
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter, TokenTextSplitter
+from pydantic import BaseModel, Field, model_validator
 
-from langchain_text_splitters import (
-    RecursiveCharacterTextSplitter,
-    TokenTextSplitter,
-)
-
-from Ingestion.pdf_ingestor import ExtractionResult, PageResult
-from Chunker.shared_models import Chunk, ChunkMethod, ChunkedDocument   
+from Chunker.shared_models import Chunk, ChunkMethod, ChunkedDocument
+from Ingestion.pdf_ingestor import ExtractionResult
 
 logger = logging.getLogger(__name__)
 
+
+
+
+class ChunkStrategy(str, Enum):
+    SEMANTIC  = "semantic"
+    RECURSIVE = "recursive"
+    TOKEN     = "token"
+
+
+
+
 class ChunkerConfig(BaseModel):
 
-    semantic_breakpoint_type: str = Field(
-        default="percentile",
-        description="SemanticChunker breakpoint type: 'percentile' | 'standard_deviation' | 'interquartile'",
-    )
-    semantic_breakpoint_threshold: float = Field(
-        default=95.0,
-        gt=0,
-        description="Threshold value passed to SemanticChunker",
-    )
-    embeddings_model: str = Field(
-        default="models/embedding-001",
-        description="Gemini embedding model",
+    strategy: ChunkStrategy = Field(
+        default=ChunkStrategy.RECURSIVE,
+        description="Chunking strategy. Chosen at construction; never changed at runtime.",
     )
 
-    recursive_chunk_size: int = Field(default=1000, gt=0)
-    recursive_chunk_overlap: int = Field(default=200, ge=0)
+    # Semantic
+    semantic_breakpoint_type: str = Field(
+        default="percentile",
+        description="SemanticChunker breakpoint type: percentile | standard_deviation | interquartile",
+    )
+    semantic_breakpoint_threshold: float = Field(default=95.0, gt=0)
+    embeddings_model: str = Field(default="models/embedding-001")
+
+    # Recursive
+    recursive_chunk_size: int    = Field(default=1000, gt=0)
+    recursive_chunk_overlap: int = Field(default=200,  ge=0)
     recursive_separators: list[str] = Field(
         default_factory=lambda: ["\n\n", "\n", ". ", " ", ""]
     )
 
-    token_chunk_size: int = Field(default=512, gt=0)
-    token_chunk_overlap: int = Field(default=50, ge=0)
-    token_encoding_name: str = Field(
-        default="cl100k_base",
-        description="tiktoken encoding name",
-    )
+    # Token
+    token_chunk_size: int    = Field(default=512, gt=0)
+    token_chunk_overlap: int = Field(default=50,  ge=0)
+    token_encoding_name: str = Field(default="cl100k_base")
 
-    add_start_index: bool = Field(
-        default=True,
-        description="Annotate each chunk with its char offset in the source text",
-    )
+    @model_validator(mode="after")
+    def validate_overlaps(self) -> ChunkerConfig:
+        if self.recursive_chunk_overlap >= self.recursive_chunk_size:
+            raise ValueError(
+                f"recursive_chunk_overlap ({self.recursive_chunk_overlap}) "
+                f"must be < recursive_chunk_size ({self.recursive_chunk_size})"
+            )
+        if self.token_chunk_overlap >= self.token_chunk_size:
+            raise ValueError(
+                f"token_chunk_overlap ({self.token_chunk_overlap}) "
+                f"must be < token_chunk_size ({self.token_chunk_size})"
+            )
+        return self
 
 
-#chunker for pdf_ingestor
 class TextChunker:
-    def __init__(self,config: Optional[ChunkerConfig] = None, google_api_key: Optional[str] = None,):
+    """
+    Chunks plain text (PDFs, web pages) using a single, explicit strategy.
+
+    Strategy is fixed at construction time via ChunkerConfig.strategy.
+    There is no runtime fallback cascade — if the chosen strategy fails,
+    a ChunkingError is raised so the caller can handle it explicitly.
+    """
+
+    def __init__(
+        self,
+        config: Optional[ChunkerConfig] = None,
+        google_api_key: Optional[str] = None,
+    ) -> None:
         self.config = config or ChunkerConfig()
-        self._google_api_key = google_api_key
+        self._strategy_method = self._resolve_strategy_method(google_api_key)
+
+
 
     def chunk_extraction_result(self, result: ExtractionResult) -> ChunkedDocument:
-        all_chunks: list[Chunk] = []
-        method_used: Optional[ChunkMethod] = None
+        """
+        Chunk a PDF ExtractionResult.
 
-        for page_result in result.pages:
-            page_text = page_result.text.text
-            if not page_text.strip():
-                continue
+        For SEMANTIC strategy: concatenates all pages first so semantic
+        boundaries are not artificially broken at page edges.
+        For RECURSIVE / TOKEN: chunks page-by-page to preserve provenance.
+        """
+        if self.config.strategy == ChunkStrategy.SEMANTIC:
+            return self._chunk_document_level(result)
+        return self._chunk_page_by_page(result)
 
-            chunks, method = self._chunk_text(
-                text=page_text,
-                page_number=page_result.page_number,
-                chunk_offset=len(all_chunks),
-            )
-            all_chunks.extend(chunks)
-            if method_used is None:
-                method_used = method
-
-        return ChunkedDocument(
-            filepath=result.filepath,
-            total_pages=result.total_pages,
-            chunk_method_used=method_used or ChunkMethod.TOKEN,
-            total_chunks=len(all_chunks),
-            chunks=all_chunks,
-        )
-    
-    #text chunker for web pages
-    def chunk_text(self,text: str,source_label: str = "unknown",page_number: int = -1) -> ChunkedDocument:
-        chunks, method = self._chunk_text(
+    def chunk_text(self, text: str, source_label: str = "unknown") -> ChunkedDocument:
+        """Chunk an arbitrary string (e.g. scraped web page)."""
+        chunks = self._run_strategy(
             text=text,
-            page_number=page_number,
+            filepath=source_label,
+            page_number=None,
             chunk_offset=0,
         )
         return ChunkedDocument(
             filepath=source_label,
-            total_pages=1,
-            chunk_method_used=method,
+            chunk_method_used=ChunkMethod(self.config.strategy.value),
             total_chunks=len(chunks),
             chunks=chunks,
         )
-    
-    def _chunk_text(self,text: str,page_number: int,chunk_offset: int,) -> tuple[list[Chunk], ChunkMethod]:
-        for strategy, method in [(self._try_semantic, ChunkMethod.SEMANTIC),(self._try_recursive, ChunkMethod.RECURSIVE),(self._try_token, ChunkMethod.TOKEN)]:
-            try:
-                raw_chunks = strategy(text)
-                if raw_chunks:
-                    chunks = self._to_chunk_models(
-                        raw_chunks, page_number, chunk_offset, method, text
-                    )
-                    logger.debug(
-                        "page=%d  method=%s  chunks=%d",
-                        page_number, method.value, len(chunks),
-                    )
-                    return chunks, method
-            except Exception as exc:
-                logger.warning(
-                    "Chunking strategy '%s' failed for page %d: %s — trying next.",
-                    method.value, page_number, exc,
-                )
-        logger.error(
-            "All chunking strategies failed for page %d. Returning single chunk.",
-            page_number,
-        )
-        fallback = [Chunk(
-            chunk_index=chunk_offset,
-            page_number=page_number,
-            text=text,
-            char_start=0,
-            method=ChunkMethod.TOKEN,
-        )]
-        return fallback, ChunkMethod.TOKEN
-    
-    def _try_semantic(self, text: str) -> list[str]:
-        from langchain_experimental.text_splitter import SemanticChunker
-        from langchain_google_genai import GoogleGenerativeAIEmbeddings
-    
-        embeddings = GoogleGenerativeAIEmbeddings(
-            model=self.config.embeddings_model,
-            google_api_key=self._google_api_key,
-        )
-    
-        splitter = SemanticChunker(
-            embeddings=embeddings,
-            breakpoint_threshold_type=self.config.semantic_breakpoint_type,
-            breakpoint_threshold_amount=self.config.semantic_breakpoint_threshold,
-            add_start_index=self.config.add_start_index,
-        )
-    
-        docs = splitter.create_documents([text])
-    
-        return [
-            d.page_content
-            for d in docs
-            if d.page_content.strip()
-        ]
-    
-    def _try_recursive(self, text: str) -> list[str]:
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=self.config.recursive_chunk_size,
-            chunk_overlap=self.config.recursive_chunk_overlap,
-            separators=self.config.recursive_separators,
-            add_start_index=self.config.add_start_index,
-        )
-        docs = splitter.create_documents([text])
-        return [d.page_content for d in docs if d.page_content.strip()]
-    
-    def _try_token(self, text: str) -> list[str]:
-        splitter = TokenTextSplitter(
-            encoding_name=self.config.token_encoding_name,
-            chunk_size=self.config.token_chunk_size,
-            chunk_overlap=self.config.token_chunk_overlap,
-        )
-        docs = splitter.create_documents([text])
-        return [d.page_content for d in docs if d.page_content.strip()]
-    
-    def _to_chunk_models(self,raw_chunks: list[str],page_number: int,chunk_offset: int,method: ChunkMethod,source_text: str) -> list[Chunk]:
-        result: list[Chunk] = []
-        search_start = 0
 
-        for i, chunk_text in enumerate(raw_chunks):
-            char_start: Optional[int] = None
 
-            if self.config.add_start_index:
-                idx = source_text.find(chunk_text, search_start)
-                if idx != -1:
-                    char_start = idx
-                    search_start = idx + len(chunk_text)
-
-            result.append(
-                Chunk(
-                    chunk_index=chunk_offset + i,
-                    page_number=page_number,
-                    text=chunk_text,
-                    char_start=char_start,
-                    method=method,
+    def _chunk_page_by_page(self, result: ExtractionResult) -> ChunkedDocument:
+        all_chunks: list[Chunk] = []
+        for page in result.pages:
+            text = page.text.text
+            if not text.strip():
+                continue
+            all_chunks.extend(
+                self._run_strategy(
+                    text=text,
+                    filepath=result.filepath,
+                    page_number=page.page_number,
+                    chunk_offset=len(all_chunks),
                 )
             )
+        return ChunkedDocument(
+            filepath=result.filepath,
+            chunk_method_used=ChunkMethod(self.config.strategy.value),
+            total_chunks=len(all_chunks),
+            chunks=all_chunks,
+        )
 
+    def _chunk_document_level(self, result: ExtractionResult) -> ChunkedDocument:
+        full_text = "\n".join(
+            p.text.text for p in result.pages if p.text.text.strip()
+        )
+        chunks = self._run_strategy(
+            text=full_text,
+            filepath=result.filepath,
+            page_number=None,   # semantic chunks don't map 1-to-1 to pages
+            chunk_offset=0,
+        )
+        return ChunkedDocument(
+            filepath=result.filepath,
+            chunk_method_used=ChunkMethod.SEMANTIC,
+            total_chunks=len(chunks),
+            chunks=chunks,
+        )
+
+
+    def _run_strategy(
+        self,
+        text: str,
+        filepath: str,
+        page_number: Optional[int],
+        chunk_offset: int,
+    ) -> list[Chunk]:
+        try:
+            docs = self._strategy_method(text)
+        except Exception as exc:
+            raise ChunkingError(
+                f"Chunking failed (strategy={self.config.strategy.value}, "
+                f"filepath={filepath}, page={page_number})"
+            ) from exc
+
+        return self._to_chunk_models(
+            docs=docs,
+            filepath=filepath,
+            page_number=page_number,
+            chunk_offset=chunk_offset,
+        )
+
+    def _resolve_strategy_method(self, google_api_key: Optional[str]):
+        """
+        Build and cache the splitter once at construction.
+        Returns a callable: str -> list[Document].
+        """
+        cfg = self.config
+
+        if cfg.strategy == ChunkStrategy.RECURSIVE:
+            splitter = RecursiveCharacterTextSplitter(
+                chunk_size=cfg.recursive_chunk_size,
+                chunk_overlap=cfg.recursive_chunk_overlap,
+                separators=cfg.recursive_separators,
+                add_start_index=True,
+            )
+            return splitter.create_documents
+
+        if cfg.strategy == ChunkStrategy.TOKEN:
+            splitter = TokenTextSplitter(
+                encoding_name=cfg.token_encoding_name,
+                chunk_size=cfg.token_chunk_size,
+                chunk_overlap=cfg.token_chunk_overlap,
+            )
+            return splitter.create_documents
+
+        if cfg.strategy == ChunkStrategy.SEMANTIC:
+            from langchain_experimental.text_splitter import SemanticChunker
+            from langchain_google_genai import GoogleGenerativeAIEmbeddings
+
+            embeddings = GoogleGenerativeAIEmbeddings(
+                model=cfg.embeddings_model,
+                google_api_key=google_api_key,
+            )
+            splitter = SemanticChunker(
+                embeddings=embeddings,
+                breakpoint_threshold_type=cfg.semantic_breakpoint_type,
+                breakpoint_threshold_amount=cfg.semantic_breakpoint_threshold,
+                add_start_index=True,
+            )
+            return splitter.create_documents
+
+        raise ValueError(f"Unknown strategy: {cfg.strategy}")
+
+
+
+    def _to_chunk_models(
+        self,
+        docs: list[Document],
+        filepath: str,
+        page_number: Optional[int],
+        chunk_offset: int,
+    ) -> list[Chunk]:
+        result: list[Chunk] = []
+        for i, doc in enumerate(docs):
+            text = doc.page_content
+            if not text.strip():
+                continue
+            # LangChain provides start_index when add_start_index=True
+            # — no post-hoc .find() needed
+            char_start: Optional[int] = doc.metadata.get("start_index")
+
+            result.append(Chunk(
+                chunk_id=self._make_chunk_id(filepath, text),
+                text=text,
+                raw_code="",
+                method=ChunkMethod(self.config.strategy.value),
+                metadata={
+                    "page_number": page_number,
+                    "char_start": char_start,
+                    "chunk_index": chunk_offset + i,
+                    "filepath": filepath,
+                },
+            ))
         return result
+
+    @staticmethod
+    def _make_chunk_id(filepath: str, chunk_text: str) -> str:
+        """
+        Content-addressed ID: stable across reruns, independent of position.
+        If the same text appears twice in a document, IDs will collide —
+        acceptable trade-off; position-based IDs break on parallel ingestion.
+        """
+        key = f"{filepath}::{chunk_text}"
+        return hashlib.sha256(key.encode()).hexdigest()[:16]
+
+
+class ChunkingError(RuntimeError):
+    pass

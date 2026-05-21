@@ -185,3 +185,4 @@ class Pipeline:
         if h in self._seen_hashes:
             return True
         self._seen_hashes.add(h)
+        return False

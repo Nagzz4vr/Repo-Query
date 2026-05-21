@@ -1,113 +1,209 @@
 from __future__ import annotations
 
-import logging
-import uuid
+import pickle
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 import faiss
 import numpy as np
-from langchain_community.docstore.in_memory import InMemoryDocstore
-from langchain_community.vectorstores import FAISS
-from langchain_core.documents import Document
 from pydantic import BaseModel, Field
 
-from Chunker.chunk_metadata import ChunkMetadata
 
-logger = logging.getLogger(__name__)
 
 
 class VectorStoreConfig(BaseModel):
-    embedding_dim: int = Field(default=1024, description="BAAI/bge-m3 output dim")
-    index_type: str = Field(default="flat_l2", description="flat_l2 | flat_ip | hnsw")
-    save_dir: Optional[str] = Field(default=None, description="Directory to persist the index")
+    embedding_dim: int = 1024
+
+    index_type: str = "flat_ip"
+
+    save_dir: Optional[str] = None
+
+
+
+
+class VectorRecord(BaseModel):
+    id: str
+
+    vector: list[float]
+
+    metadata: dict
+
+    document: str
+
+
+
 
 class VectorStore:
 
-    def __init__(self, config: Optional[VectorStoreConfig] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[VectorStoreConfig] = None,
+    ) -> None:
+
         self.config = config or VectorStoreConfig()
-        self._store: Optional[FAISS] = None
-        self._build_empty_store()
 
-    def add(self, results: list[dict[str, Any]]) -> list[str]:
+        self.index = self._build_index()
 
-        vectors, documents, ids = [], [], []
+        self.records: dict[int, VectorRecord] = {}
 
-        for item in results:
-            doc_id = str(uuid.uuid4())
-            vectors.append(item["vector"])
-            documents.append(
-                Document(
-                    page_content=item["metadata"].get("chunk_name", ""),
-                    metadata=item["metadata"],
-                )
-            )
-            ids.append(doc_id)
+        self._next_idx = 0
 
-            self._store.add_embeddings(
-                text_embeddings=list(zip([d.page_content for d in documents], vectors)),
-                metadatas=[d.metadata for d in documents],
-                ids=ids,
-            )
 
-            logger.info("Added %d chunks to vector store.", len(ids))
-            return ids
-        
-    def search(self,query_vector: np.ndarray,top_k: int = 5) -> list[dict[str, Any]]:
-        
-        docs_and_scores = self._store.similarity_search_by_vector(
-            query_vector, k=top_k
+
+    def add(
+        self,
+        records: list[VectorRecord],
+    ) -> list[str]:
+
+        if not records:
+            return []
+
+        vectors = np.asarray(
+            [r.vector for r in records],
+            dtype=np.float32,
         )
-        return [
-            {
-                "score": score,
-                "metadata": ChunkMetadata(**doc.metadata),   
-            }
-            for doc, score in docs_and_scores
-        ]
-    
-    def save(self, directory: Optional[str] = None) -> Path:
-        """Persist index + docstore to disk."""
-        save_dir = Path(directory or self.config.save_dir or "vector_store_index")
-        save_dir.mkdir(parents=True, exist_ok=True)
-        self._store.save_local(str(save_dir))
-        logger.info("Vector store saved to %s", save_dir)
+
+        if self.config.index_type == "flat_ip":
+            faiss.normalize_L2(vectors)
+
+        self.index.add(vectors)
+
+        ids: list[str] = []
+
+        for record in records:
+
+            internal_idx = self._next_idx
+
+            self.records[internal_idx] = record
+
+            self._next_idx += 1
+
+            ids.append(record.id)
+
+        return ids
+
+
+    def search(
+        self,
+        query_vector: np.ndarray,
+        top_k: int = 5,
+    ) -> list[dict]:
+
+        query = np.asarray(
+            [query_vector],
+            dtype=np.float32,
+        )
+
+        if self.config.index_type == "flat_ip":
+            faiss.normalize_L2(query)
+
+        scores, indices = self.index.search(
+            query,
+            top_k,
+        )
+
+        results: list[dict] = []
+
+        for score, idx in zip(
+            scores[0],
+            indices[0],
+        ):
+
+            if idx == -1:
+                continue
+
+            record = self.records[idx]
+
+            results.append(
+                {
+                    "id": record.id,
+                    "score": float(score),
+                    "document": record.document,
+                    "metadata": record.metadata,
+                }
+            )
+
+        return results
+
+
+    def save(
+        self,
+        directory: Optional[str] = None,
+    ) -> Path:
+
+        save_dir = Path(
+            directory
+            or self.config.save_dir
+            or "vector_store"
+        )
+
+        save_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        faiss.write_index(
+            self.index,
+            str(save_dir / "index.faiss"),
+        )
+
+        with open(
+            save_dir / "records.pkl",
+            "wb",
+        ) as f:
+
+            pickle.dump(
+                {
+                    "records": self.records,
+                    "next_idx": self._next_idx,
+                },
+                f,
+            )
+
         return save_dir
 
-    def load(self, directory: Optional[str] = None) -> None:
-        """Restore a previously saved index from disk."""
-        load_dir = Path(directory or self.config.save_dir or "vector_store_index")
-        self._store = FAISS.load_local(
-            str(load_dir),
-            embeddings=_NoOpEmbeddings(),     
-            allow_dangerous_deserialization=True,
-        )
-        logger.info("Vector store loaded from %s", load_dir)
 
-    def _build_empty_store(self) -> None:
-        index = self._make_faiss_index()
-        self._store = FAISS(
-            embedding_function=_NoOpEmbeddings(),
-            index=index,
-            docstore=InMemoryDocstore(),
-            index_to_docstore_id={},
+    def load(
+        self,
+        directory: Optional[str] = None,
+    ) -> None:
+
+        load_dir = Path(
+            directory
+            or self.config.save_dir
+            or "vector_store"
         )
 
-    def _make_faiss_index(self) -> faiss.Index:
+        self.index = faiss.read_index(
+            str(load_dir / "index.faiss")
+        )
+
+        with open(
+            load_dir / "records.pkl",
+            "rb",
+        ) as f:
+
+            data = pickle.load(f)
+
+        self.records = data["records"]
+
+        self._next_idx = data["next_idx"]
+
+
+
+    def _build_index(self):
+
         dim = self.config.embedding_dim
+
         match self.config.index_type:
+
             case "flat_ip":
-                return faiss.IndexFlatIP(dim)          # cosine-friendly (normalise first)
+                return faiss.IndexFlatIP(dim)
+
             case "hnsw":
-                index = faiss.IndexHNSWFlat(dim, 32)   # 32 = M param
+                index = faiss.IndexHNSWFlat(dim, 32)
                 index.hnsw.efConstruction = 200
                 return index
-            case _:                                    # default: flat_l2
-                return faiss.IndexFlatL2(dim)
-            
-class _NoOpEmbeddings:
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        return []
 
-    def embed_query(self, text: str) -> list[float]:
-        return []
+            case _:
+                return faiss.IndexFlatL2(dim)
