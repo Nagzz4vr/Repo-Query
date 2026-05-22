@@ -9,16 +9,12 @@ import numpy as np
 from pydantic import BaseModel, Field
 
 
-
-
 class VectorStoreConfig(BaseModel):
     embedding_dim: int = 1024
 
     index_type: str = "flat_ip"
 
     save_dir: Optional[str] = None
-
-
 
 
 class VectorRecord(BaseModel):
@@ -29,8 +25,6 @@ class VectorRecord(BaseModel):
     metadata: dict
 
     document: str
-
-
 
 
 class VectorStore:
@@ -85,8 +79,10 @@ class VectorStore:
 
     def search(
         self,
+        text_query: str,
         query_vector: np.ndarray,
         top_k: int = 5,
+        rrf_k: int = 60, 
     ) -> list[dict]:
 
         query = np.asarray(
@@ -97,35 +93,41 @@ class VectorStore:
         if self.config.index_type == "flat_ip":
             faiss.normalize_L2(query)
 
-        scores, indices = self.index.search(
-            query,
-            top_k,
-        )
+        pool_size = top_k * 2 
+        dense_scores, dense_indices = self.index.search(query, pool_size)
+        
+        dense_results = [idx for idx in dense_indices[0] if idx != -1]
+
+        tokenized_query = text_query.lower().split()
+
+        bm25_scores = self.bm25.get_scores(tokenized_query)
+        sparse_results = np.argsort(bm25_scores)[::-1][:pool_size].tolist()
+
+        rrf_scores = {}
+
+        for rank, idx in enumerate(dense_results):
+            rrf_scores[idx] = rrf_scores.get(idx, 0.0) + (1.0 / (rrf_k + (rank + 1)))
+
+        for rank, idx in enumerate(sparse_results):
+            rrf_scores[idx] = rrf_scores.get(idx, 0.0) + (1.0 / (rrf_k + (rank + 1)))
+
+        fused_results = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
 
         results: list[dict] = []
-
-        for score, idx in zip(
-            scores[0],
-            indices[0],
-        ):
-
-            if idx == -1:
-                continue
-
+        for idx, rrf_score in fused_results:
             record = self.records[idx]
-
             results.append(
                 {
                     "id": record.id,
-                    "score": float(score),
+                    "score": float(rrf_score),
                     "document": record.document,
                     "metadata": record.metadata,
                 }
             )
 
         return results
-
-
+    
+    
     def save(
         self,
         directory: Optional[str] = None,

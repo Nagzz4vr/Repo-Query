@@ -72,7 +72,6 @@ class ConversationMemory:
     def _default_token_heuristic(self, text: str) -> int:
         return int(len(text) / self.config.approx_chars_per_token)
 
-    # ── PUBLIC API & WRITING ──────────────────────────────────────────
 
     def add_turn(self, role: Literal["user", "assistant"], content: str) -> None:
         """Appends a conversation turn with eager token accounting evaluation."""
@@ -87,7 +86,6 @@ class ConversationMemory:
         self._summary = None
         self._provenance = None
 
-    # ── DETERMINISTIC SERIALIZATION LAYER ─────────────────────────────
 
     def format_as_messages(self) -> List[ChatMessage]:
         """
@@ -118,7 +116,6 @@ class ConversationMemory:
             parts.append(f"[{turn.timestamp.isoformat()}] {turn.role.upper()}: {turn.content}")
         return "\n".join(parts)
 
-    # ── DURABILITY & STATE MANAGEMENT ─────────────────────────────────
 
     def get_snapshot(self) -> MemorySnapshot:
         """Produces an isolated, immutable snapshot copy of current internal states."""
@@ -134,7 +131,7 @@ class ConversationMemory:
         self._provenance = snapshot.provenance
         self._turns = [t.model_copy(deep=True) for t in snapshot.turns]
 
-    # ── BUDGET AWARE EVICTION & SUMMARY ENHANCEMENT ───────────────────
+
 
     async def evict_if_needed(self, llm_client: LLMClientProtocol) -> None:
         """
@@ -170,8 +167,6 @@ class ConversationMemory:
             old_turns = self._turns[:eviction_slice_index]
             self._turns = self._turns[eviction_slice_index:]
 
-            # ── REDUCE ENTROPY VIA STRUCTURED PROVENANCE MERGING ──────────────
-            
             old_turns_text = "\n".join(
                 f"[{t.timestamp.isoformat()}] {t.role}: {t.content}" for t in old_turns
             )
