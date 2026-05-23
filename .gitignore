@@ -9,6 +9,8 @@ data/
 *.svg
 *.txt
 
+*.pdf
+
 *.jsonl
 *.parquet
 *.pkl

@@ -80,7 +80,7 @@ class QueryRewriter:
         )
         return queries, vectors
 
-    # ── strategies ────────────────────────────────────────────────────────
+
 
     async def _contextualize(self, query: str, memory: ConversationMemory) -> str:
         """Turn a follow-up question into a fully self-contained question."""
@@ -141,7 +141,7 @@ class QueryRewriter:
         general = await self._complete(prompt, max_tokens=150)
         return [general]
 
-    # ── helpers ───────────────────────────────────────────────────────────
+
 
     def _embed_queries(self, queries: list[str]) -> list[np.ndarray]:
         """Reuse the Embedder by wrapping strings in minimal Chunk objects."""

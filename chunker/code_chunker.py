@@ -30,9 +30,49 @@ class LanguageChunker(ABC):
     @abstractmethod
     def chunk(self, source_file: SourceFile) -> ChunkedDocument:
         pass
-
+    
 class PythonASTParser(LanguageChunker):
     """Parses source files into structural symbols and walks dependencies."""
+    def __init__(
+        self,
+        policy_engine: Optional[ChunkPolicyEngine] = None,
+    ) -> None:
+        # Policy can be injected for testing or overridden per-language.
+        # Defaults are sensible for Python specifically.
+        self._policy = policy_engine or ChunkPolicyEngine(
+            min_lines=4,
+            merge_small_methods=True,
+        )
+
+    def chunk(self, source_file: SourceFile) -> ChunkedDocument:
+        """
+        Satisfies LanguageChunker ABC.
+        Full contract: SourceFile → ChunkedDocument.
+        parse() is the internal AST step; this owns the file-level result.
+        """
+        result = self.parse(source_file)
+
+        if not result.success:
+            # Let CodeIntelligenceOrchestrator's fallback handler take over.
+            # Raising here gives it a clean signal rather than returning
+            # a half-populated ChunkedDocument.
+            raise ValueError(result.error_message or "AST parse failed")
+
+        filtered = self._policy.apply_policies(result.symbols)
+
+        chunks = [
+            ChunkProjectionFactory.materialize(s, result.metrics)
+            for s in filtered
+        ]
+
+        return ChunkedDocument(
+            filepath=source_file.filepath,
+            chunk_method_used=ChunkMethod.AST,
+            total_chunks=len(chunks),
+            chunks=chunks,
+            graph_edges=result.edges,
+            metadata={"parse_metrics": result.metrics},
+        )
     
     def parse(self, source_file: SourceFile) -> ParserResult:
         start_time = time.perf_counter()
@@ -179,12 +219,12 @@ class ChunkProjectionFactory:
     @staticmethod
     def create_lexical_search_text(symbol: SymbolIR) -> str:
         return f"""Symbol: {symbol.name}
-Type: {symbol.type.value}
-Path: {symbol.symbol_path}
-Signature: {symbol.signature}
-Docstring: {symbol.docstring or 'None provided'}
-Code:
-{symbol.code_segment}"""
+                Type: {symbol.type.value}
+                Path: {symbol.symbol_path}
+                Signature: {symbol.signature}
+                Docstring: {symbol.docstring or 'None provided'}
+                Code:
+                {symbol.code_segment}"""
 
     @staticmethod
     def materialize(symbol: SymbolIR, parser_metrics: Dict[str, Any]) -> Chunk:

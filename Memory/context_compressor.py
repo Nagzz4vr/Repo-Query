@@ -31,22 +31,6 @@ class CompressionConfig(BaseModel):
 
 
 class ContextCompressor:
-    """
-    Two-stage context compression pipeline.
-
-    Stage 1 — similarity_filter:
-        Re-score retrieved chunks against the query vector and drop any whose
-        cosine similarity falls below the threshold. Fast, no LLM calls.
-
-    Stage 2 — llm_extract:
-        For each surviving chunk, ask the LLM to return only the sentences
-        that are directly relevant to the query. Chunks with nothing relevant
-        are dropped entirely.
-
-    Running both stages (strategy="both") is the recommended default:
-        - Filter removes obviously off-topic chunks cheaply.
-        - Extract trims the survivors, reducing synthesis prompt size.
-    """
 
     def __init__(
         self,
@@ -62,19 +46,7 @@ class ContextCompressor:
         query_vector: np.ndarray,
         chunks: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """
-        Parameters
-        ----------
-        query        : the (contextualised) user question
-        query_vector : unit-normalised embedding of query
-        chunks       : output of _retrieve_and_deduplicate()
-                       each dict must contain "text", "metadata", "score"
-                       and optionally "vector" (for similarity re-scoring)
 
-        Returns
-        -------
-        Compressed, ordered list of chunk dicts capped at max_chunks.
-        """
         if not chunks:
             return []
 
@@ -88,7 +60,6 @@ class ContextCompressor:
 
         return result[: self.config.max_chunks]
 
-    # ── Stage 1 ───────────────────────────────────────────────────────────
 
     def _similarity_filter(
         self,
@@ -106,8 +77,6 @@ class ContextCompressor:
             if vec is not None:
                 sim = float(np.dot(query_vector, np.asarray(vec)))
             else:
-                # FAISS flat_l2 score is squared L2 distance; convert roughly
-                # This is an approximation — prefer storing vectors when possible
                 faiss_score = chunk.get("score", 0.0)
                 sim = max(0.0, 1.0 - faiss_score / 2.0)
 
@@ -124,8 +93,6 @@ class ContextCompressor:
             len(chunks), len(kept), self.config.similarity_threshold,
         )
         return kept
-
-    # ── Stage 2 ───────────────────────────────────────────────────────────
 
     async def _llm_extract(
         self,

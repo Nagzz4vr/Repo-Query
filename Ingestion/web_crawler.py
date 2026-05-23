@@ -2,6 +2,8 @@ from pydantic import BaseModel, Field, model_validator
 from typing import  Generic, Optional, Type, TypeVar,Any
 from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, CacheMode
 from crawl4ai.extraction_strategy import LLMExtractionStrategy
+from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
+from crawl4ai.content_filter_strategy import PruningContentFilter
 import asyncio
 import os
 import json
@@ -57,7 +59,7 @@ class ScrapedMetadata(BaseModel):
     word_count: int
     has_structured_data: bool
     headers: dict[str, str] = Field(default_factory=dict)
- 
+
     @model_validator(mode="before")
     @classmethod
     def _coerce_headers(cls, values: dict) -> dict:
@@ -82,8 +84,8 @@ class UniversalScraper:
         self,
         provider: str = "openai/gpt-4o-mini",
         api_token: Optional[str] = None,
-        max_tokens: int = 4000,
-        token_threshold: float = 0.5,
+        min_word_threshold: int = 10,   
+        pruning_threshold: float = 0.48,      
         max_attempts: int = 3,
         wait_min: float = 2.0,
         wait_max: float = 30.0,
@@ -100,8 +102,8 @@ class UniversalScraper:
                 "OPENAI_API_KEY / ANTHROPIC_API_KEY."
             )
 
-        self.max_tokens = max_tokens
-        self.token_threshold = token_threshold
+        self.pruning_threshold = pruning_threshold
+        self.min_word_threshold = min_word_threshold
         self.max_attempts = max_attempts
         self.wait_min = wait_min
         self.wait_max = wait_max
@@ -157,14 +159,18 @@ class UniversalScraper:
     ) -> ExtractionResult[T]:
         logger.debug("Crawling: %s", url)
         run_cfg = CrawlerRunConfig(
-            cache_mode=CacheMode.BYPASS,
-            word_count_threshold=10,
-            excluded_tags=["form", "nav", "footer", "header"],
-            remove_overlay_elements=True,
-            fit_markdown=True,                 
-            max_tokens=self.max_tokens,      
-            token_threshold=self.token_threshold,
-        )
+    markdown_generator=DefaultMarkdownGenerator(
+        content_filter=PruningContentFilter(
+    threshold=self.pruning_threshold,
+    threshold_type="fixed",
+    min_word_threshold=self.min_word_threshold,
+)
+    ),
+    cache_mode=CacheMode.BYPASS,
+    word_count_threshold=10,
+    excluded_tags=["form", "nav", "footer", "header"],
+    remove_overlay_elements=True,
+)
 
         async with AsyncWebCrawler() as crawler:
                 crawl_result = await crawler.arun(url=url, config=run_cfg)
@@ -262,13 +268,13 @@ class UniversalScraper:
             )
         return self._strategy_cache[key]
     
-    @staticmethod
-    def _estimate_tokens(text: str) -> int:
-        return max(len(text) // 4, 0)
+    # @staticmethod
+    # def _estimate_tokens(text: str) -> int:
+    #     return max(len(text) // 4, 0)
  
-    @staticmethod
-    def _calculate_hash(text: str) -> str:
-        return hashlib.sha256(text.encode()).hexdigest()
+    # @staticmethod
+    # def _calculate_hash(text: str) -> str:
+    #     return hashlib.sha256(text.encode()).hexdigest()
     
     def _failure_result(
         self, url: str, content_type: str, error: str
@@ -315,7 +321,7 @@ class UniversalScraper:
                 original_token_count=original_tokens,
                 compressed_token_count=compressed_tokens,
                 compression_ratio=compression_ratio,
-                content_hash=self._sha256(raw_markdown),
+                content_hash=self._calculate_hash(raw_markdown),
                 headers=dict(crawl_result.metadata.get("headers", {})),
                 links_count=(
                     len(crawl_result.links.get("internal", []))
