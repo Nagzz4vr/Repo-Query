@@ -173,7 +173,7 @@ class Embedder:
         model_name: str = "BAAI/bge-m3",
     ) -> None:
 
-        self.model = SentenceTransformer(model_name)
+        self.model = SentenceTransformer(model_name,local_files_only=True)
 
     def embed(
         self,

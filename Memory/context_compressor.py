@@ -1,145 +1,143 @@
 from __future__ import annotations
 
-import logging
-from typing import Any, Literal, Optional
+import re
+from typing import List, Dict, Any
 
-import anthropic
 import numpy as np
 from pydantic import BaseModel, Field
 
-logger = logging.getLogger(__name__)
-
 
 class CompressionConfig(BaseModel):
-    strategy: Literal["similarity_filter", "llm_extract", "both"] = Field(
-        default="both",
-        description=(
-            "similarity_filter — drop chunks below cosine-similarity threshold\n"
-            "llm_extract       — LLM keeps only sentences relevant to the query\n"
-            "both              — filter first (cheap), then extract (thorough)"
-        ),
-    )
-    similarity_threshold: float = Field(
-        default=0.30, ge=0.0, le=1.0,
-        description="Min cosine similarity to survive the filter step",
-    )
-    max_chunks: int = Field(default=6, ge=1, description="Hard cap after compression")
-    max_extracted_chars: int = Field(
-        default=800, description="Char limit per chunk after LLM extraction"
-    )
-    model: str = Field(default="claude-sonnet-4-20250514")
+    token_budget: int = 1200
+    min_sentence_score: float = 0.15
+    chunk_keep_ratio: float = 0.5
+    max_sentences_per_chunk: int = 8
+    redundancy_threshold: float = 0.92
 
 
 class ContextCompressor:
 
-    def __init__(
-        self,
-        client: anthropic.AsyncAnthropic,
-        config: Optional[CompressionConfig] = None,
-    ) -> None:
-        self.client = client
+    def __init__(self,reranker,config: CompressionConfig | None = None,):
+        self.reranker = reranker
         self.config = config or CompressionConfig()
 
-    async def compress(
-        self,
-        query: str,
-        query_vector: np.ndarray,
-        chunks: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
 
-        if not chunks:
-            return []
+    async def compress(self,query: str,query_vector: np.ndarray,chunks: List[Dict[str, Any]],) -> List[Dict[str, Any]]:
 
-        result = list(chunks)
-
-        if self.config.strategy in ("similarity_filter", "both"):
-            result = self._similarity_filter(query_vector, result)
-
-        if self.config.strategy in ("llm_extract", "both"):
-            result = await self._llm_extract(query, result)
-
-        return result[: self.config.max_chunks]
+            if not chunks:
+                return []
 
 
-    def _similarity_filter(
-        self,
-        query_vector: np.ndarray,
-        chunks: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """
-        Re-rank by cosine similarity (vectors are unit-normalised so dot = cosine).
-        Fall back to FAISS score when the raw vector is absent.
-        """
-        scored: list[tuple[float, dict]] = []
+            reranked = self._rerank_chunks(query, chunks)
 
-        for chunk in chunks:
-            vec = chunk.get("vector")
-            if vec is not None:
-                sim = float(np.dot(query_vector, np.asarray(vec)))
-            else:
-                faiss_score = chunk.get("score", 0.0)
-                sim = max(0.0, 1.0 - faiss_score / 2.0)
-
-            if sim >= self.config.similarity_threshold:
-                chunk = dict(chunk)
-                chunk["similarity"] = sim
-                scored.append((sim, chunk))
-
-        scored.sort(key=lambda t: t[0], reverse=True)
-        kept = [c for _, c in scored]
-
-        logger.debug(
-            "Similarity filter: %d → %d chunks (threshold=%.2f)",
-            len(chunks), len(kept), self.config.similarity_threshold,
-        )
-        return kept
-
-    async def _llm_extract(
-        self,
-        query: str,
-        chunks: list[dict[str, Any]],
-    ) -> list[dict[str, Any]]:
-        """
-        Ask the LLM to extract only relevant sentences from each chunk.
-        Chunks whose entire content is irrelevant are dropped.
-        """
-        compressed: list[dict[str, Any]] = []
-
-        for chunk in chunks:
-            text = chunk.get("text", "").strip()
-            if not text:
-                continue
-
-            response = await self.client.messages.create(
-                model=self.config.model,
-                max_tokens=self.config.max_extracted_chars // 3,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": (
-                            "Extract only the lines or sentences from the passage "
-                            "below that are directly relevant to answering the query. "
-                            "Preserve code exactly as written. "
-                            "If nothing is relevant respond with exactly: IRRELEVANT\n\n"
-                            f"Query: {query}\n\n"
-                            f"Passage:\n{text}\n\n"
-                            "Relevant content:"
-                        ),
-                    }
-                ],
+            keep_n = max(
+                1,
+                int(len(reranked) * self.config.chunk_keep_ratio),
             )
-            extracted = response.content[0].text.strip()
 
-            if not extracted or extracted.upper() == "IRRELEVANT":
-                logger.debug("Chunk dropped as irrelevant by LLM extractor.")
-                continue
+            reranked = reranked[:keep_n]
 
-            new_chunk = dict(chunk)
-            new_chunk["text"] = extracted[: self.config.max_extracted_chars]
-            new_chunk["compressed"] = True
-            compressed.append(new_chunk)
 
-        logger.debug(
-            "LLM extraction: %d → %d chunks", len(chunks), len(compressed)
+            compressed = []
+
+            for chunk in reranked:
+                compressed_text = self._extract_relevant_sentences(
+                    query,
+                    chunk["text"],
+                )
+
+                if compressed_text.strip():
+                    chunk["compressed_text"] = compressed_text
+                    compressed.append(chunk)
+
+
+            compressed = self._deduplicate(compressed)
+
+
+            compressed = self._fit_token_budget(compressed)
+
+            return compressed
+    
+    def _rerank_chunks(self,query: str,chunks: List[Dict[str, Any]],) -> List[Dict[str, Any]]:
+
+        return self.reranker.rerank(
+            query=query,
+            chunks=chunks,
+            top_k=len(chunks),
         )
-        return compressed
+    
+    def _extract_relevant_sentences(self,query: str,text: str,) -> str:
+        sentences = self._split_sentences(text)
+        if not sentences:
+            return ""
+        scores = self.reranker.score_sentences(
+            query=query,
+            sentences=sentences,
+        )
+        ranked = sorted(
+            zip(sentences, scores),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        selected = []
+        for sentence, score in ranked:
+            if score < self.config.min_sentence_score:
+                continue
+            selected.append(sentence)
+            if len(selected) >= self.config.max_sentences_per_chunk:
+                break
+        return "\n".join(selected)
+    
+    def _deduplicate(self,chunks: List[Dict[str, Any]],) -> List[Dict[str, Any]]:
+        unique = []
+        for chunk in chunks:
+            text = chunk["compressed_text"]
+            is_duplicate = False
+            for existing in unique:
+                similarity = self._jaccard_similarity(
+                    text,
+                    existing["compressed_text"],
+                )
+                if similarity >= self.config.redundancy_threshold:
+                    is_duplicate = True
+                    break
+            if not is_duplicate:
+                unique.append(chunk)
+        return unique
+    
+    def _fit_token_budget(self,chunks: List[Dict[str, Any]],) -> List[Dict[str, Any]]:
+        total_tokens = 0
+        final_chunks = []
+
+        for chunk in chunks:
+
+            text = chunk["compressed_text"]
+
+            approx_tokens = self._estimate_tokens(text)
+
+            if total_tokens + approx_tokens > self.config.token_budget:
+                break
+
+            total_tokens += approx_tokens
+            final_chunks.append(chunk)
+
+        return final_chunks
+    
+    def _split_sentences(self, text: str) -> List[str]:
+        lines = [
+            x.strip()
+            for x in re.split(r"(?<=[.!?])\s+|\n+", text)
+            if x.strip()
+        ]
+
+        return lines
+
+    def _estimate_tokens(self, text: str) -> int:
+        return int(len(text.split()) * 1.3)
+
+    def _jaccard_similarity(self,a: str,b: str,) -> float:
+        sa = set(a.lower().split())
+        sb = set(b.lower().split())
+        if not sa or not sb:
+            return 0.0
+        return len(sa & sb) / len(sa | sb)
