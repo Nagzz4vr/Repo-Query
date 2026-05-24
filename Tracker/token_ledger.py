@@ -19,9 +19,10 @@ class TokenLedger:
         return hashlib.sha256(raw.encode()).hexdigest()
 
     def record(self, *, user_id, agent_id, model,
-                prompt_tokens, completion_tokens,
-                latency_ms=0, cache_hit=False,
-                retry_count=0, tool_calls=0):
+            prompt_tokens, completion_tokens,
+            latency_ms=0, cache_hit=False,
+            retry_count=0, tool_calls=0,
+            success=True, error=None):  
 
         total_tokens = prompt_tokens + completion_tokens
         cost = self._calculate_cost(model, prompt_tokens, completion_tokens)

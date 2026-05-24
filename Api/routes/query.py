@@ -48,3 +48,26 @@ async def reset_memory():
     return {
         "status": "memory_reset"
     }
+
+@router.get("/debug/chunks")
+async def debug_chunks(limit: int = 20, offset: int = 0):
+    store = query_engine.vector_store
+    records = list(store.records.items())
+    page = records[offset : offset + limit]
+    return {
+        "total": store._next_idx,
+        "offset": offset,
+        "limit": limit,
+        "chunks": [
+            {
+                "idx": idx,
+                "id": r.id,
+                "source": r.metadata.get("source", ""),
+                "path": r.metadata.get("path", ""),
+                "type": r.metadata.get("type", ""),
+                "symbol": r.metadata.get("symbol_path", ""),
+                "preview": r.document[:300],
+            }
+            for idx, r in page
+        ],
+    }

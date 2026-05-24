@@ -1,9 +1,10 @@
 from pydantic import BaseModel, Field, model_validator
 from typing import  Generic, Optional, Type, TypeVar,Any
-from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, CacheMode
+from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, CacheMode,LLMConfig
 from crawl4ai.extraction_strategy import LLMExtractionStrategy
 from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
 from crawl4ai.content_filter_strategy import PruningContentFilter
+
 import asyncio
 import os
 import json
@@ -157,65 +158,76 @@ class UniversalScraper:
         instruction: str,
         content_type: str,
     ) -> ExtractionResult[T]:
+        """
+        Windows-safe wrapper: runs the Playwright crawler in a fresh thread
+        with its own ProactorEventLoop to avoid SelectorEventLoop limitations.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: asyncio.run(
+                self._scrape_core(url, schema, instruction, content_type)
+            ),
+        )
+
+    async def _scrape_core(
+        self,
+    url: str,
+    schema: Type[T],
+    instruction: str,
+    content_type: str,
+) -> ExtractionResult[T]:
         logger.debug("Crawling: %s", url)
+
+        from crawl4ai import LLMConfig
+
+        extraction_strategy = LLMExtractionStrategy(
+            llm_config=LLMConfig(
+                provider=self.provider,
+                api_token=self.api_token,
+            ),
+            schema=schema.model_json_schema(),
+            instruction=instruction,
+        )
+
         run_cfg = CrawlerRunConfig(
-    markdown_generator=DefaultMarkdownGenerator(
-        content_filter=PruningContentFilter(
-    threshold=self.pruning_threshold,
-    threshold_type="fixed",
-    min_word_threshold=self.min_word_threshold,
-)
-    ),
-    cache_mode=CacheMode.BYPASS,
-    word_count_threshold=10,
-    excluded_tags=["form", "nav", "footer", "header"],
-    remove_overlay_elements=True,
-)
+            markdown_generator=DefaultMarkdownGenerator(
+                content_filter=PruningContentFilter(
+                    threshold=self.pruning_threshold,
+                    threshold_type="fixed",
+                    min_word_threshold=self.min_word_threshold,
+                )
+            ),
+            extraction_strategy=extraction_strategy,   # ← pass here, not called manually
+            cache_mode=CacheMode.BYPASS,
+            word_count_threshold=10,
+            excluded_tags=["form", "nav", "footer", "header"],
+            remove_overlay_elements=True,
+        )
 
         async with AsyncWebCrawler() as crawler:
-                crawl_result = await crawler.arun(url=url, config=run_cfg)
+            crawl_result = await crawler.arun(url=url, config=run_cfg)
+
         if not crawl_result.success:
             raise ConnectionError(
                 f"Crawl failed for {url}: {crawl_result.error_message}"
             )
-        raw_markdown: str = crawl_result.markdown.raw_markdown
 
-        compressed_markdown: str = (
-            crawl_result.markdown.fit_markdown or raw_markdown
-        )
+        raw_markdown: str = crawl_result.markdown.raw_markdown
+        compressed_markdown: str = crawl_result.markdown.fit_markdown or raw_markdown
 
         original_tokens = self._estimate_tokens(raw_markdown)
         compressed_tokens = self._estimate_tokens(compressed_markdown)
-        compression_ratio = (
-            compressed_tokens / original_tokens if original_tokens else 0.0
-        )
-        logger.debug(
-            "Tokens — original: %d  compressed: %d  ratio: %.1f%%",
-            original_tokens,
-            compressed_tokens,
-            compression_ratio * 100,
-        )
+        compression_ratio = compressed_tokens / original_tokens if original_tokens else 0.0
 
-        logger.debug("Extracting structured data with %s", self.provider)
-        strategy = self._get_strategy(schema, instruction)
-
+        # Extracted data is now in crawl_result.extracted_content
+        extracted_data: T | None = None
         try:
-            extracted_json: str = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: strategy.extract(
-                    url=crawl_result.url,
-                    html=compressed_markdown,
-                ),
-            )
-        except Exception as exc:
-            raise ConnectionError(f"LLM extraction failed: {exc}") from exc
-        
-
-        try:
-            extracted_data: T = schema.model_validate_json(extracted_json)
+            raw_json = crawl_result.extracted_content
+            if raw_json:
+                extracted_data = schema.model_validate_json(raw_json)
         except Exception as exc:
             logger.warning("Schema validation failed: %s", exc)
-            logger.debug("Raw LLM output: %s", extracted_json)
             return self._partial_result(
                 url=url,
                 content_type=content_type,
@@ -227,7 +239,7 @@ class UniversalScraper:
                 crawl_result=crawl_result,
                 error=f"Schema validation error: {exc}",
             )
-        
+
         metadata = ScrapedMetadata(
             url=url,
             title=crawl_result.metadata.get("title", "Unknown"),
@@ -246,10 +258,9 @@ class UniversalScraper:
             content_type=content_type,
             language=crawl_result.metadata.get("language"),
             word_count=len(raw_markdown.split()),
-            has_structured_data=True,
+            has_structured_data=extracted_data is not None,
         )
 
-        logger.debug("Extraction complete for %s", url)
         return ExtractionResult(
             metadata=metadata,
             extracted_data=extracted_data,
@@ -260,14 +271,27 @@ class UniversalScraper:
     def _get_strategy(self, schema: Type[T], instruction: str) -> LLMExtractionStrategy:
         key = (json.dumps(schema.model_json_schema(), sort_keys=True), instruction)
         if key not in self._strategy_cache:
-            self._strategy_cache[key] = LLMExtractionStrategy(
-                provider=self.provider,
-                api_token=self.api_token,
-                schema=schema.model_json_schema(),
-                instruction=instruction,
-            )
+            try:
+                # crawl4ai >= 0.4 uses LLMConfig
+                from crawl4ai import LLMConfig
+                self._strategy_cache[key] = LLMExtractionStrategy(
+                    llm_config=LLMConfig(
+                        provider=self.provider,
+                        api_token=self.api_token,
+                    ),
+                    schema=schema.model_json_schema(),
+                    instruction=instruction,
+                )
+            except ImportError:
+                # crawl4ai < 0.4 fallback
+                self._strategy_cache[key] = LLMExtractionStrategy(
+                    provider=self.provider,
+                    api_token=self.api_token,
+                    schema=schema.model_json_schema(),
+                    instruction=instruction,
+                )
         return self._strategy_cache[key]
-    
+
     # @staticmethod
     # def _estimate_tokens(text: str) -> int:
     #     return max(len(text) // 4, 0)

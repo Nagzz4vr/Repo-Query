@@ -103,25 +103,27 @@ class ChunkingPipeline:
 
 
     async def _chunk_code(self, doc: IngestedDocument) -> ChunkedDocument:
-        """
-        Adapts IngestedDocument → SourceFile and runs the AST orchestrator
-        in a thread so it doesn't block the event loop.
-        """
         if not doc.path:
             raise ValueError(f"CODE document {doc.document_id} has no path — cannot build SourceFile")
-
+    
         source_file = SourceFile(
             filepath=doc.path,
             source_code=doc.content,
-            language=doc.language or "python",   # explicit default; callers should always set this
+            language=doc.language or "unknown",
         )
-
+    
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(
+        chunked = await loop.run_in_executor(
             None,
             self._code_orchestrator.process_file,
             source_file,
         )
+    
+        # Non-Python files fall back to a single blob — re-chunk with TextChunker instead
+        if chunked.chunk_method_used == ChunkMethod.FALLBACK_TEXT and len(doc.content) > 500:
+            return await self._chunk_text(doc)
+    
+        return chunked
 
     async def _chunk_text(self, doc: IngestedDocument) -> ChunkedDocument:
         source_label = doc.path or doc.url or doc.source

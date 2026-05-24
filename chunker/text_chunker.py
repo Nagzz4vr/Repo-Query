@@ -161,7 +161,7 @@ class TextChunker:
         chunk_offset: int,
     ) -> list[Chunk]:
         try:
-            docs = self._strategy_method(text)
+            docs = self._strategy_method([text])
         except Exception as exc:
             raise ChunkingError(
                 f"Chunking failed (strategy={self.config.strategy.value}, "

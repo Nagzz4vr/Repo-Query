@@ -16,23 +16,32 @@ from Vector_Store.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
 
+# Add these to QueryConfig
 class QueryConfig(BaseModel):
-    top_k_retrieval: int = Field(
-        default=10,
-        description="Chunks fetched per query variant before reranking/compression.",
-    )
-    top_k_final: int = Field(
-        default=5,
-        description="Chunks passed to LLM synthesis after compression.",
-    )
-    system_prompt: str = Field(
-        default=(
-            "You are an expert code assistant. Answer questions about the codebase "
-            "using ONLY the provided context snippets. "
-            "Always cite the source file path and line numbers when referencing code. "
-            "If the answer cannot be determined from the context, say so clearly."
-        )
-    )
+    top_k_retrieval: int = Field(default=10)
+    top_k_final: int = Field(default=5)
+
+    system_prompt_code: str = Field(default=(
+        "You are an expert code assistant. You are given code snippets from a codebase. "
+        "Answer questions directly and confidently based on the code. "
+        "Reference class names, function names, and file paths in your answer. "
+        "Never say 'without more context' — reason from what you can see in the code."
+    ))
+    system_prompt_pdf: str = Field(default=(
+        "You are an expert research assistant. You are given excerpts from a PDF document. "
+        "Answer questions based strictly on the provided text. "
+        "Quote or paraphrase relevant passages. Cite page numbers when available. "
+        "If the answer is not in the excerpts, say so briefly."
+    ))
+    system_prompt_web: str = Field(default=(
+        "You are a helpful assistant. You are given content scraped from web pages. "
+        "Summarize and answer based on the provided content. "
+        "Mention the source URL when relevant. Be concise and direct."
+    ))
+    system_prompt_default: str = Field(default=(
+        "You are a helpful assistant. Answer questions using the provided context. "
+        "Be direct and cite sources where possible."
+    ))
 
 class QueryResult(BaseModel):
     question: str
@@ -93,6 +102,7 @@ class QueryEngine:
         chunks, queries = await self._run_pipeline(question)
         context = self._build_context_string(chunks)
         history = self.memory.format_as_messages()
+        system_prompt = self._pick_system_prompt(chunks)
 
         messages = [
             *history,
@@ -101,7 +111,7 @@ class QueryEngine:
 
         collected: list[str] = []
         async for token in self.client.stream(
-            system_prompt=self.config.system_prompt,
+            system_prompt=system_prompt,
             messages=messages,
         ):
             collected.append(token)
@@ -124,13 +134,15 @@ class QueryEngine:
         queries, vectors = await self.rewriter.rewrite(question, self.memory)
 
         raw_chunks = self._retrieve_and_deduplicate(queries, vectors)
-
+        logger.info("After dedup: %d chunks", len(raw_chunks))      
         compressed = await self.compressor.compress(
             query=queries[0],
             query_vector=vectors[0],
             chunks=raw_chunks,
         )
+        logger.info("After compression: %d chunks", len(compressed))  
         compressed = compressed[: self.config.top_k_final]
+        logger.info("After top_k slice: %d chunks", len(compressed)) 
         return compressed, queries
 
     def _retrieve_and_deduplicate(
@@ -154,8 +166,13 @@ class QueryEngine:
             for r in results:
                 # metadata is a plain dict from VectorRecord.metadata
                 meta: dict = r.get("metadata") or {}
-                path = meta.get("symbol_path") or meta.get("path") or "unknown"
-                start = meta.get("start_line") or ""
+                path = (
+                    meta.get("symbol_path")
+                    or meta.get("filepath")      # ← TextChunker uses this
+                    or meta.get("path")
+                    or "unknown"
+                        )
+                start = meta.get("start_line") or meta.get("char_start") or ""
                 key = f"{path}:{start}"
                 if key not in seen:
                     seen.add(key)
@@ -176,14 +193,14 @@ class QueryEngine:
     ) -> str:
         context = self._build_context_string(chunks)
         history = self.memory.format_as_messages()
+        system_prompt = self._pick_system_prompt(chunks)   # ← dynamic
 
         messages = [
             *history,
             {"role": "user", "content": self._user_prompt(question, context)},
         ]
-
         return await self.client.generate(
-            system_prompt=self.config.system_prompt,
+            system_prompt=system_prompt,
             messages=messages,
         )
 
@@ -194,9 +211,14 @@ class QueryEngine:
             # Prefer compressed_text if ContextCompressor trimmed the chunk
             text = chunk.get("compressed_text") or chunk.get("text", "")
             text = text.strip()
-            path = meta.get("symbol_path") or meta.get("path") or "unknown"
-            start = meta.get("start_line", "?")
-            end = meta.get("end_line", "?")
+            path = (
+                meta.get("symbol_path")
+                or meta.get("filepath")      # ← TextChunker stores it here
+                or meta.get("path")
+                or "unknown"
+                    )
+            start = meta.get("start_line") or meta.get("page_number") or "?"
+            end   = meta.get("end_line")   or meta.get("page_number") or "?"
             lang = meta.get("language") or meta.get("modality") or ""
             fence = lang if lang not in ("text", "markdown", "") else ""
             parts.append(
@@ -204,6 +226,29 @@ class QueryEngine:
                 f"```{fence}\n{text}\n```"
             )
         return "\n\n".join(parts)
+    
+    def _pick_system_prompt(self, chunks: list[dict[str, Any]]) -> str:
+        """Choose system prompt based on majority source type in retrieved chunks."""
+        counts = {"code": 0, "pdf": 0, "web": 0}
+        for chunk in chunks:
+            meta = chunk.get("metadata") or {}
+            source_type = meta.get("source_type", "")
+            if source_type == "code":
+                counts["code"] += 1
+            elif source_type == "pdf":
+                counts["pdf"] += 1
+            elif source_type == "web":
+                counts["web"] += 1
+
+        dominant = max(counts, key=counts.get)
+        if counts[dominant] == 0:
+            return self.config.system_prompt_default
+
+        return {
+            "code": self.config.system_prompt_code,
+            "pdf":  self.config.system_prompt_pdf,
+            "web":  self.config.system_prompt_web,
+        }[dominant]
 
     def _user_prompt(self, question: str, context: str) -> str:
         return f"Context from the codebase:\n\n{context}\n\nQuestion: {question}"

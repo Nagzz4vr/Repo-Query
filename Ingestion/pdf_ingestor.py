@@ -113,21 +113,30 @@ class PdfIngestor:
         self._validate_exists()
 
     def _validate_safe_path(self, user_path: str) -> Path:
-        """Validate user_path is within base_dir"""
+        """Validate user_path is within base_dir or system temp dir."""
+        import tempfile
+    
         if not user_path or not user_path.strip():
             raise ValueError("Path cannot be empty or whitespace")
-        
-        target = (self.base_dir / user_path).resolve()
-        
+    
+        # Absolute paths resolve directly; relative paths resolve against base_dir
+        raw = Path(user_path)
+        target = raw.resolve() if raw.is_absolute() else (self.base_dir / user_path).resolve()
+    
         if target == self.base_dir:
             raise ValueError(f"Path resolves to base directory itself: {target}")
-        
-        if self.base_dir not in target.parents:
+    
+        temp_dir = Path(tempfile.gettempdir()).resolve()
+    
+        in_base = self.base_dir in target.parents
+        in_temp = temp_dir in target.parents or target.parent == temp_dir
+    
+        if not in_base and not in_temp:
             raise SecurityError(
                 f"Path traversal detected: '{user_path}' resolves to '{target}', "
                 f"which is outside base directory '{self.base_dir}'"
             )
-        
+    
         return target
     
     def _validate_exists(self):

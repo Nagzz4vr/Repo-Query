@@ -84,7 +84,11 @@ class CodeIngestor:
             raise ValueError("Provide only one of local_path or github_repo, not both.")
 
         self.local_path = local_path
-        self.github_repo = github_repo
+        self.github_repo = (
+    github_repo.rstrip("/").split("github.com/")[-1]
+    if "github.com/" in github_repo
+    else github_repo
+)
         self.max_file_size = max_file_size
 
         self.github_token = github_token or os.getenv("GITHUB_TOKEN")
@@ -102,7 +106,7 @@ class CodeIngestor:
                 self.github_branch = github_branch
                 logger.info(f"Using pinned branch: {self.github_branch}")
             else:
-                self.github_branch = self._get_default_branch(github_repo)
+                self.github_branch = self._get_default_branch(self.github_repo)
                 logger.info(f"Auto-detected default branch: {self.github_branch}")
         else:
             self.github_branch = github_branch or "main"  # unused for local, but keeps the attribute defined
@@ -173,15 +177,23 @@ class CodeIngestor:
     def _walk_github(self) -> Iterator[dict]:
         logger.info(f"Walking GitHub repo: {self.github_repo} (branch: {self.github_branch})")
         file_count = 0
-
+    
         tree = self._fetch_git_tree()
         if not tree:
             logger.error("Failed to fetch repo tree. Aborting.")
             return
-
-        blobs = [node for node in tree if node.get("type") == "blob"]
+    
+        # Filter out blobs inside skipped directories
+        blobs = [
+            node for node in tree
+            if node.get("type") == "blob"
+            and not any(
+                part in SKIP_DIRS
+                for part in Path(node["path"]).parts
+            )
+        ]
+    
         logger.info(f"Total files in tree: {len(blobs)}")
-
         for node in blobs:
             path = node["path"]
             filename = Path(path).name

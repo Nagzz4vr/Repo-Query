@@ -115,7 +115,10 @@ class WritePipeline:
 
                 # Chunk → RetrievalChunk → embed → VectorRecord → store
                 retrieval_chunks = self._to_retrieval_chunks(chunks, result.source_type)
-                records = self.embedding_pipeline.run(retrieval_chunks)
+                loop = asyncio.get_running_loop()
+                records = await loop.run_in_executor(
+                    None, self.embedding_pipeline.run, retrieval_chunks
+                )
                 vector_records = self._to_vector_store_records(records)
                 self.vector_store.add(vector_records)
                 total_vectors += len(vector_records)
@@ -180,21 +183,27 @@ class WritePipeline:
         chunks: list[Chunk],
         source_type: SourceType,
     ) -> list[RetrievalChunk]:
-        """Adapt Chunker.Chunk → Embedder.RetrievalChunk."""
 
         modality_map = {
             SourceType.CODE: RetrievalModality.CODE,
             SourceType.PDF: RetrievalModality.PDF,
             SourceType.WEB: RetrievalModality.MARKDOWN,
         }
-        modality = modality_map.get(source_type, RetrievalModality.TEXT)
+        default_modality = modality_map.get(source_type, RetrievalModality.TEXT)
 
         result = []
         for chunk in chunks:
             meta = chunk.metadata
 
+            # Fallback chunks have no symbol_path — treat as plain text
+            is_code_chunk = (
+                default_modality == RetrievalModality.CODE
+                and meta.get("symbol_path")  # ← key guard
+            )
+            modality = default_modality if is_code_chunk else RetrievalModality.TEXT
+
             semantic_node: Optional[SemanticNode] = None
-            if modality == RetrievalModality.CODE and meta.get("symbol_path"):
+            if is_code_chunk:
                 semantic_node = SemanticNode(
                     symbol_path=meta["symbol_path"],
                     name=meta.get("name", ""),

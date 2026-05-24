@@ -21,3 +21,4 @@ data/
 cache_storage/
 outputs/
 traces/
+token_ledger/

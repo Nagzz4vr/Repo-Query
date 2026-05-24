@@ -30,6 +30,7 @@ class LiteLLMClient:
             session_id=session_id,
             log_dir=log_dir,
         )
+        self.user_id     = None
 
         self.api_key    = os.environ["GROQ_API_KEY"]
 
@@ -59,7 +60,7 @@ class LiteLLMClient:
             start = time.perf_counter()
 
             try:
-
+                self.agent_id=self.current_model
                 response = await asyncio.to_thread(
                     completion,
                     model=self.current_model,

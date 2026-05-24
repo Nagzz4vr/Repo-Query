@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 class CompressionConfig(BaseModel):
     token_budget: int = 1200
-    min_sentence_score: float = 0.15
+    min_sentence_score: float =  -5.0   
     chunk_keep_ratio: float = 0.5
     max_sentences_per_chunk: int = 8
     redundancy_threshold: float = 0.92
@@ -66,19 +66,20 @@ class ContextCompressor:
             top_k=len(chunks),
         )
     
-    def _extract_relevant_sentences(self,query: str,text: str,) -> str:
+    def _extract_relevant_sentences(self, query: str, text: str) -> str:
         sentences = self._split_sentences(text)
         if not sentences:
-            return ""
-        scores = self.reranker.score_sentences(
-            query=query,
-            sentences=sentences,
-        )
-        ranked = sorted(
-            zip(sentences, scores),
-            key=lambda x: x[1],
-            reverse=True,
-        )
+            return text[:500]  # fallback
+    
+        # Drop fragments too short to be meaningful
+        sentences = [s for s in sentences if len(s.split()) >= 5]
+    
+        if not sentences:
+            return text[:500]  # fallback if all sentences are fragments
+    
+        scores = self.reranker.score_sentences(query=query, sentences=sentences)
+        ranked = sorted(zip(sentences, scores), key=lambda x: x[1], reverse=True)
+    
         selected = []
         for sentence, score in ranked:
             if score < self.config.min_sentence_score:
@@ -86,6 +87,10 @@ class ContextCompressor:
             selected.append(sentence)
             if len(selected) >= self.config.max_sentences_per_chunk:
                 break
+            
+        if not selected:
+            selected = [s for s, _ in ranked[:3]]
+    
         return "\n".join(selected)
     
     def _deduplicate(self,chunks: List[Dict[str, Any]],) -> List[Dict[str, Any]]:
